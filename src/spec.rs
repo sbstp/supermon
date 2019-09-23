@@ -7,7 +7,7 @@ fn _vec_string_new() -> Vec<String> {
 }
 
 fn _string_new() -> String {
-    String::new()
+    ".".into()
 }
 
 fn _u32_one() -> u32 {
