@@ -1,16 +1,16 @@
+use std::collections::BTreeMap;
 use std::io::{self, BufRead, BufReader, Read, StderrLock, StdoutLock, Write};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
-use std::collections::BTreeMap;
 
 use crossbeam_channel::bounded;
 use crossbeam_utils::thread::scope;
 
-use crate::events::{Event, EventKind, EventReceiver, EventSender, StreamKind, Pid};
-use crate::spec::{AppInfo, Spec};
+use crate::events::{Event, EventKind, EventReceiver, EventSender, Pid, StreamKind};
 use crate::reaper;
+use crate::spec::{AppInfo, Spec};
 
 fn read_line<R>(reader: &mut BufReader<R>, buf: &mut Vec<u8>) -> io::Result<usize>
 where
@@ -74,7 +74,7 @@ fn spawn_thread(app: Arc<AppInfo>, sender: EventSender, delay: Duration) {
         Ok(proc) => {
             let _ = sender.send(Event::new(&app, EventKind::Started(Pid(proc.id()))));
             proc
-        },
+        }
         Err(err) => {
             let _ = sender.send(Event::new(&app, EventKind::SpawnError(err)));
             return;
@@ -145,6 +145,7 @@ pub fn run(spec: Spec) {
         apps.push(Arc::new(AppInfo::new(name, app_spec)));
     }
 
+    // Initial spawning of the apps. Does not spawn disabled apps.
     for app in apps {
         if !app.disable {
             spawn(app, sender.clone(), Duration::from_secs(0));
@@ -159,24 +160,23 @@ pub fn run(spec: Spec) {
         stderr: stderr.lock(),
     };
 
-    let mut pid_app_map = BTreeMap::new();
+    let mut pid_map = BTreeMap::new();
 
     for event in receiver {
         match event {
-            Event::App { app, kind } => {
-                match kind {
-                    EventKind::Line(stream_kind, line) => logger.log_app_line(&app, stream_kind, &line),
-                    EventKind::Started(pid) => {
-                        pid_app_map.insert(pid, app);
-                    }
-                    EventKind::SpawnError(err) => {
-                        logger.log_msg(format!("Error spawning app {}: {}", app.name, err));
-                    }
-                    _ => {}
+            Event::App { app, kind } => match kind {
+                EventKind::Line(stream_kind, line) => logger.log_app_line(&app, stream_kind, &line),
+                EventKind::Started(pid) => {
+                    pid_map.insert(pid, app.clone());
+                    logger.log_msg(format!("{} spawned with pid {}", app.name, pid));
                 }
-            }
+                EventKind::SpawnError(err) => {
+                    logger.log_msg(format!("Error spawning app {}: {}", app.name, err));
+                }
+                _ => {}
+            },
             Event::Exited(pid, code) => {
-                if let Some(app) = pid_app_map.get(&pid) {
+                if let Some(app) = pid_map.get(&pid) {
                     logger.log_msg(format!("{} has exited with code {}", app.name, code));
                     if app.restart {
                         logger.log_msg(format!("restarting app {} in {} sec(s)", app.name, app.restart_delay));
@@ -189,10 +189,11 @@ pub fn run(spec: Spec) {
                 } else {
                     logger.log_msg(format!("zombie {} has been reaped", code));
                 }
-            }
-            Event::Signaled(pid, signal) => {
 
+                // Try to remove the PID from the map to prevent overgrowth.
+                pid_map.remove(&pid);
             }
+            Event::Signaled(pid, signal) => {}
         }
     }
 }
