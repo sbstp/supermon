@@ -163,15 +163,12 @@ pub fn run(spec: Spec) {
             EventKind::Line(stream_kind, line) => logger.log_app_line(&app, stream_kind, &line),
             EventKind::Exit(status) => {
                 let _ = match status.code() {
-                    Some(code) => logger.log_msg(format!("[supermon] {} has exited with code {}", app.name, code)),
-                    None => logger.log_msg(format!("[supermon] {} has exited from a signal", app.name)),
+                    Some(code) => logger.log_msg(format!("{} has exited with code {}", app.name, code)),
+                    None => logger.log_msg(format!("{} has exited from a signal", app.name)),
                 };
 
                 if app.restart {
-                    logger.log_msg(format!(
-                        "[supermon] restarting app {} in {} sec(s)",
-                        app.name, app.restart_delay
-                    ));
+                    logger.log_msg(format!("restarting app {} in {} sec(s)", app.name, app.restart_delay));
                     spawn(
                         app.clone(),
                         sender.clone(),
@@ -180,7 +177,7 @@ pub fn run(spec: Spec) {
                 }
             }
             EventKind::SpawnError(err) => {
-                logger.log_msg(format!("[supermon] Error spawning app {}: {}", app.name, err));
+                logger.log_msg(format!("Error spawning app {}: {}", app.name, err));
             }
             _ => {}
         }
