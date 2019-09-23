@@ -3,12 +3,14 @@ use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
+use std::collections::BTreeMap;
 
 use crossbeam_channel::bounded;
 use crossbeam_utils::thread::scope;
 
-use crate::events::{Event, EventKind, EventReceiver, EventSender, StreamKind};
+use crate::events::{Event, EventKind, EventReceiver, EventSender, StreamKind, Pid};
 use crate::spec::{AppInfo, Spec};
+use crate::reaper;
 
 fn read_line<R>(reader: &mut BufReader<R>, buf: &mut Vec<u8>) -> io::Result<usize>
 where
@@ -69,7 +71,10 @@ fn spawn_thread(app: Arc<AppInfo>, sender: EventSender, delay: Duration) {
         .current_dir(&app.workdir)
         .spawn()
     {
-        Ok(proc) => proc,
+        Ok(proc) => {
+            let _ = sender.send(Event::new(&app, EventKind::Started(Pid(proc.id()))));
+            proc
+        },
         Err(err) => {
             let _ = sender.send(Event::new(&app, EventKind::SpawnError(err)));
             return;
@@ -88,11 +93,6 @@ fn spawn_thread(app: Arc<AppInfo>, sender: EventSender, delay: Duration) {
                 stream_handler(app.clone(), sender.clone(), stderr, StreamKind::Stderr);
             });
         }
-
-        let _ = match proc.wait() {
-            Ok(status) => sender.send(Event::new(&app, EventKind::Exit(status))),
-            Err(err) => sender.send(Event::new(&app, EventKind::WaitError(err))),
-        };
     });
 }
 
@@ -137,6 +137,8 @@ impl<'o, 'e> Logger<'o, 'e> {
 pub fn run(spec: Spec) {
     let (sender, receiver): (EventSender, EventReceiver) = bounded(128);
 
+    reaper::start(sender.clone());
+
     let mut apps = Vec::new();
 
     for (name, app_spec) in spec.apps.into_iter() {
@@ -157,29 +159,40 @@ pub fn run(spec: Spec) {
         stderr: stderr.lock(),
     };
 
-    for event in receiver {
-        let app = event.app;
-        match event.kind {
-            EventKind::Line(stream_kind, line) => logger.log_app_line(&app, stream_kind, &line),
-            EventKind::Exit(status) => {
-                let _ = match status.code() {
-                    Some(code) => logger.log_msg(format!("{} has exited with code {}", app.name, code)),
-                    None => logger.log_msg(format!("{} has exited from a signal", app.name)),
-                };
+    let mut pid_app_map = BTreeMap::new();
 
-                if app.restart {
-                    logger.log_msg(format!("restarting app {} in {} sec(s)", app.name, app.restart_delay));
-                    spawn(
-                        app.clone(),
-                        sender.clone(),
-                        Duration::from_secs(app.restart_delay as u64),
-                    );
+    for event in receiver {
+        match event {
+            Event::App { app, kind } => {
+                match kind {
+                    EventKind::Line(stream_kind, line) => logger.log_app_line(&app, stream_kind, &line),
+                    EventKind::Started(pid) => {
+                        pid_app_map.insert(pid, app);
+                    }
+                    EventKind::SpawnError(err) => {
+                        logger.log_msg(format!("Error spawning app {}: {}", app.name, err));
+                    }
+                    _ => {}
                 }
             }
-            EventKind::SpawnError(err) => {
-                logger.log_msg(format!("Error spawning app {}: {}", app.name, err));
+            Event::Exited(pid, code) => {
+                if let Some(app) = pid_app_map.get(&pid) {
+                    logger.log_msg(format!("{} has exited with code {}", app.name, code));
+                    if app.restart {
+                        logger.log_msg(format!("restarting app {} in {} sec(s)", app.name, app.restart_delay));
+                        spawn(
+                            app.clone(),
+                            sender.clone(),
+                            Duration::from_secs(app.restart_delay as u64),
+                        );
+                    }
+                } else {
+                    logger.log_msg(format!("zombie {} has been reaped", code));
+                }
             }
-            _ => {}
+            Event::Signaled(pid, signal) => {
+
+            }
         }
     }
 }

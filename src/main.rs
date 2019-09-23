@@ -1,10 +1,12 @@
 mod events;
 mod reactor;
+mod reaper;
 mod spec;
 
-use serde_yaml;
 use std::fs::File;
 use std::io::BufReader;
+
+use serde_yaml;
 
 use crate::spec::Spec;
 
