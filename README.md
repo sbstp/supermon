@@ -5,7 +5,7 @@ aggregates the output of the processes it spawns (stdout/stderr) and prints it t
 output available to the container engine.
 
 Its main advantages are:
-* **lightweight**: It uses around ~1 MB of memory at runtime, including the binary shared memory. The binary uses less than 2 MB on disk.
+* **lightweight**: It uses around ~1 MiB of memory at runtime, including the binary shared memory. The binary uses less than 500 KiB on disk.
 * **easy to use**: A simple YAML spec is passed to **supermon** to tell it which processes to spawn and manage.
 * **easy to install**: You only need to copy a single binary in your container image.
 
