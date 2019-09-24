@@ -187,7 +187,7 @@ pub fn run(spec: Spec) {
                         );
                     }
                 } else {
-                    logger.log_msg(format!("zombie {} has been reaped", code));
+                    logger.log_msg(format!("zombie {} has been reaped", pid));
                 }
 
                 // Try to remove the PID from the map to prevent overgrowth.
