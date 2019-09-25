@@ -1,5 +1,5 @@
 use std::collections::BTreeMap;
-use std::io::{self, BufRead, BufReader, Read, StderrLock, StdoutLock, Write};
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
 use std::sync::Arc;
@@ -8,10 +8,11 @@ use std::time::Duration;
 
 use crossbeam_utils::thread::scope;
 use nix::sys::signal::{kill, Signal};
-use nix::unistd::{setpgid, Pid};
+use nix::unistd::setpgid;
 
 use crate::events::{Event, EventKind, EventReceiver, EventSender, StreamKind};
 use crate::spec::{AppInfo, Spec};
+use crate::utils::Pid;
 
 fn read_line<R>(reader: &mut BufReader<R>, buf: &mut Vec<u8>) -> io::Result<usize>
 where
@@ -72,7 +73,7 @@ fn spawn_thread(app: Arc<AppInfo>, sender: EventSender, delay: Duration) {
             .stderr(stderr)
             .current_dir(&app.workdir)
             .pre_exec(|| {
-                setpgid(Pid::from_raw(0), Pid::from_raw(0)); // TODO handle error
+                setpgid(Pid(0).to_nix(), Pid(0).to_nix()); // TODO handle error
                 Ok(())
             })
             .spawn()
@@ -109,132 +110,141 @@ fn spawn(app: Arc<AppInfo>, sender: EventSender, delay: Duration) {
     });
 }
 
-struct Logger<'o, 'e> {
-    stdout: StdoutLock<'o>,
-    stderr: StderrLock<'e>,
+fn write_app_line_to_stream<W>(mut writer: W, app: &AppInfo, line: &[u8]) -> io::Result<()>
+where
+    W: Write,
+{
+    write!(writer, "[{}] ", app.name)?;
+    writer.write_all(&line)?;
+    writer.write_all(&b"\n"[..])?;
+    writer.flush()?;
+    Ok(())
 }
 
-impl<'o, 'e> Logger<'o, 'e> {
-    fn write_app_line_to_stream<W>(mut writer: W, app: &AppInfo, line: &[u8]) -> io::Result<()>
+pub struct Reactor {
+    stdout: io::Stdout,
+    stderr: io::Stderr,
+    sender: EventSender,
+    receiver: Option<EventReceiver>,
+    processes: BTreeMap<Pid, Arc<AppInfo>>,
+    shutdown_requested: bool,
+}
+
+impl Reactor {
+    pub fn new(sender: EventSender, receiver: EventReceiver) -> Reactor {
+        Reactor {
+            stdout: io::stdout(),
+            stderr: io::stderr(),
+            sender: sender,
+            receiver: Some(receiver),
+            processes: BTreeMap::new(),
+            shutdown_requested: false,
+        }
+    }
+
+    fn log<A>(&mut self, log: A)
     where
-        W: Write,
+        A: AsRef<str>,
     {
-        write!(writer, "[{}] ", app.name)?;
-        writer.write_all(&line)?;
-        writer.write_all(&b"\n"[..])?;
-        writer.flush()?;
-        Ok(())
+        let _ = write!(self.stderr, "[supermon] {}\n", log.as_ref());
     }
 
     fn log_app_line(&mut self, app: &AppInfo, stream_kind: StreamKind, line: &[u8]) {
         let _ = match stream_kind {
-            StreamKind::Stdout => Logger::write_app_line_to_stream(&mut self.stdout, &app, line),
-            StreamKind::Stderr => Logger::write_app_line_to_stream(&mut self.stderr, &app, line),
+            StreamKind::Stdout => write_app_line_to_stream(&mut self.stdout, &app, line),
+            StreamKind::Stderr => write_app_line_to_stream(&mut self.stderr, &app, line),
         };
     }
 
-    fn log_msg<A>(&mut self, msg: A)
+    fn start_app<D>(&self, app: &Arc<AppInfo>, delay: D)
     where
-        A: AsRef<str>,
+        D: Into<Option<Duration>>,
     {
-        let _ = writeln!(self.stderr, "[supermon] {}", msg.as_ref());
-    }
-}
-
-pub fn run(spec: Spec, sender: EventSender, receiver: EventReceiver) {
-    let mut apps = Vec::new();
-
-    for (name, app_spec) in spec.apps.into_iter() {
-        apps.push(Arc::new(AppInfo::new(name, app_spec)));
-    }
-
-    // Initial spawning of the apps. Does not spawn disabled apps.
-    for app in apps {
-        if !app.disable {
-            spawn(app, sender.clone(), Duration::from_secs(0));
+        if !app.disable && !self.shutdown_requested {
+            spawn(
+                app.clone(),
+                self.sender.clone(),
+                delay.into().unwrap_or(Duration::from_secs(0)),
+            );
         }
     }
 
-    let stdout = std::io::stdout();
-    let stderr = std::io::stderr();
+    fn restart_app(&mut self, app: &Arc<AppInfo>) {
+        if app.restart && !self.shutdown_requested {
+            self.log(format!("restarting app {} in {} sec(s)", app.name, app.restart_delay));
+            self.start_app(app, Some(Duration::from_secs(app.restart_delay as u64)));
+        }
+    }
 
-    let mut logger = Logger {
-        stdout: stdout.lock(),
-        stderr: stderr.lock(),
-    };
+    fn initialize(&self, spec: Spec) {
+        for (name, app_spec) in spec.apps.into_iter() {
+            let app = Arc::new(AppInfo::new(name, app_spec));
+            self.start_app(&app, None);
+        }
+    }
 
-    let mut pid_map = BTreeMap::new();
-    let mut shutdown_requested = false;
+    fn shutdown(&mut self, signal: Signal) {
+        self.shutdown_requested = true;
 
-    for event in receiver {
-        match event {
-            Event::App { app, kind } => match kind {
-                EventKind::Line(stream_kind, line) => logger.log_app_line(&app, stream_kind, &line),
-                EventKind::Started(pid) => {
-                    pid_map.insert(pid, app.clone());
-                    logger.log_msg(format!("{} spawned with pid {}", app.name, pid));
+        for pid in self.processes.keys() {
+            kill(pid.to_nix(), signal);
+        }
+    }
+
+    fn can_exit(&self) -> bool {
+        println!("can exit {:?} {}", self.shutdown_requested, self.processes.len());
+        self.shutdown_requested && self.processes.len() == 0
+    }
+
+    fn handle_app_event(&mut self, app: &Arc<AppInfo>, kind: EventKind) {
+        match kind {
+            EventKind::Line(stream_kind, line) => self.log_app_line(&app, stream_kind, &line),
+            EventKind::Started(pid) => {
+                self.processes.insert(pid, app.clone());
+                self.log(format!("{} spawned with pid {}", app.name, pid));
+            }
+            EventKind::SpawnError(err) => {
+                self.log(format!("Error spawning app {}: {}", app.name, err));
+            }
+            _ => {}
+        }
+    }
+
+    pub fn run(mut self, spec: Spec) {
+        self.initialize(spec);
+
+        for event in self.receiver.take().unwrap() {
+            match event {
+                Event::App { app, kind } => self.handle_app_event(&app, kind),
+                Event::Signal(signal) => {
+                    self.shutdown(signal);
                 }
-                EventKind::SpawnError(err) => {
-                    logger.log_msg(format!("Error spawning app {}: {}", app.name, err));
+                Event::Exited(pid, code) => {
+                    if let Some(app) = self.processes.get(&pid).map(|x| x.clone()) {
+                        self.log(format!("{} has exited with code {}", app.name, code));
+                        self.restart_app(&app);
+                    } else {
+                        self.log(format!("zombie {} has been reaped", pid));
+                    }
+
+                    // Try to remove the PID from the process table to prevent overgrowth.
+                    self.processes.remove(&pid);
                 }
-                _ => {}
-            },
-            Event::Signal(sig) => {
-                shutdown_requested = true;
-                for (pid, app) in pid_map.iter() {
-                    logger.log_msg(format!("Killing app {} with signal {}", app.name, sig));
-                    let _ = kill(pid.to_nix(), sig);
+                Event::Signaled(pid, _) => {
+                    if let Some(app) = self.processes.get(&pid).map(|x| x.clone()) {
+                        self.restart_app(&app);
+                    }
+
+                    // Try to remove the PID from the process table to prevent overgrowth.
+                    self.processes.remove(&pid);
                 }
             }
-            Event::Exited(pid, code) => {
-                if let Some(app) = pid_map.get(&pid) {
-                    logger.log_msg(format!("{} has exited with code {}", app.name, code));
-                    if app.restart && !shutdown_requested {
-                        logger.log_msg(format!("restarting app {} in {} sec(s)", app.name, app.restart_delay));
-                        spawn(
-                            app.clone(),
-                            sender.clone(),
-                            Duration::from_secs(app.restart_delay as u64),
-                        );
-                    }
-                } else {
-                    logger.log_msg(format!("zombie {} has been reaped", pid));
-                }
 
-                // Try to remove the PID from the map to prevent overgrowth.
-                pid_map.remove(&pid);
-
-                // If we have no processes left in the pid map and that a shutdown has been requested,
-                // we can shutdown the reactor.
-                if shutdown_requested && pid_map.len() == 0 {
-                    break;
-                }
-            }
-            Event::Signaled(pid, signal) => {
-                if let Some(app) = pid_map.get(&pid) {
-                    if app.restart && !shutdown_requested {
-                        logger.log_msg(format!("restarting app {} in {} sec(s)", app.name, app.restart_delay));
-                        spawn(
-                            app.clone(),
-                            sender.clone(),
-                            Duration::from_secs(app.restart_delay as u64),
-                        );
-                    }
-                }
-
-                match signal {
-                    Signal::SIGINT | Signal::SIGTERM | Signal::SIGQUIT | Signal::SIGABRT | Signal::SIGKILL => {
-                        pid_map.remove(&pid);
-                    }
-                    _ => {}
-                }
-
-                // If we have no processes left in the pid map and that a shutdown has been requested,
-                // we can shutdown the reactor.
-                if shutdown_requested && pid_map.len() == 0 {
-                    break;
-                }
+            if self.can_exit() {
+                break;
             }
         }
     }
+
+    // TODO on exit, reap zombies by calling wait, but do not block
 }

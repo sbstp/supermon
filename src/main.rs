@@ -15,6 +15,7 @@ use signal_hook::iterator::Signals;
 
 use crate::spec::Spec;
 use crate::events::{EventSender, EventReceiver};
+use crate::reactor::Reactor;
 
 fn main() {
     let spec_path = std::env::args_os().nth(1).expect("first argument must be spec path");
@@ -40,7 +41,6 @@ fn main() {
         reaper::start(reaper_sender);
     });
 
-
-
-    reactor::run(spec, sender, receiver);
+    let reactor = Reactor::new(sender, receiver);
+    reactor.run(spec);
 }
