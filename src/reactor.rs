@@ -1,15 +1,16 @@
 use std::collections::BTreeMap;
 use std::io::{self, BufRead, BufReader, Read, StderrLock, StdoutLock, Write};
+use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
-use crossbeam_channel::bounded;
 use crossbeam_utils::thread::scope;
+use nix::sys::signal::{kill, Signal};
+use nix::unistd::{setpgid, Pid};
 
-use crate::events::{Event, EventKind, EventReceiver, EventSender, Pid, StreamKind};
-use crate::reaper;
+use crate::events::{Event, EventKind, EventReceiver, EventSender, StreamKind};
 use crate::spec::{AppInfo, Spec};
 
 fn read_line<R>(reader: &mut BufReader<R>, buf: &mut Vec<u8>) -> io::Result<usize>
@@ -64,20 +65,26 @@ fn spawn_thread(app: Arc<AppInfo>, sender: EventSender, delay: Duration) {
     let stdout = if app.stdout { Stdio::piped() } else { Stdio::null() };
     let stderr = if app.stderr { Stdio::piped() } else { Stdio::null() };
 
-    let mut proc = match Command::new(&app.exec)
-        .args(&app.args)
-        .stdout(stdout)
-        .stderr(stderr)
-        .current_dir(&app.workdir)
-        .spawn()
-    {
-        Ok(proc) => {
-            let _ = sender.send(Event::new(&app, EventKind::Started(Pid(proc.id()))));
-            proc
-        }
-        Err(err) => {
-            let _ = sender.send(Event::new(&app, EventKind::SpawnError(err)));
-            return;
+    let mut proc = unsafe {
+        match Command::new(&app.exec)
+            .args(&app.args)
+            .stdout(stdout)
+            .stderr(stderr)
+            .current_dir(&app.workdir)
+            .pre_exec(|| {
+                setpgid(Pid::from_raw(0), Pid::from_raw(0)); // TODO handle error
+                Ok(())
+            })
+            .spawn()
+        {
+            Ok(proc) => {
+                let _ = sender.send(Event::new(&app, EventKind::Started(proc.id().into())));
+                proc
+            }
+            Err(err) => {
+                let _ = sender.send(Event::new(&app, EventKind::SpawnError(err)));
+                return;
+            }
         }
     };
 
@@ -134,11 +141,7 @@ impl<'o, 'e> Logger<'o, 'e> {
     }
 }
 
-pub fn run(spec: Spec) {
-    let (sender, receiver): (EventSender, EventReceiver) = bounded(128);
-
-    reaper::start(sender.clone());
-
+pub fn run(spec: Spec, sender: EventSender, receiver: EventReceiver) {
     let mut apps = Vec::new();
 
     for (name, app_spec) in spec.apps.into_iter() {
@@ -161,6 +164,7 @@ pub fn run(spec: Spec) {
     };
 
     let mut pid_map = BTreeMap::new();
+    let mut shutdown_requested = false;
 
     for event in receiver {
         match event {
@@ -175,10 +179,17 @@ pub fn run(spec: Spec) {
                 }
                 _ => {}
             },
+            Event::Signal(sig) => {
+                shutdown_requested = true;
+                for (pid, app) in pid_map.iter() {
+                    logger.log_msg(format!("Killing app {} with signal {}", app.name, sig));
+                    let _ = kill(pid.to_nix(), sig);
+                }
+            }
             Event::Exited(pid, code) => {
                 if let Some(app) = pid_map.get(&pid) {
                     logger.log_msg(format!("{} has exited with code {}", app.name, code));
-                    if app.restart {
+                    if app.restart && !shutdown_requested {
                         logger.log_msg(format!("restarting app {} in {} sec(s)", app.name, app.restart_delay));
                         spawn(
                             app.clone(),
@@ -192,8 +203,38 @@ pub fn run(spec: Spec) {
 
                 // Try to remove the PID from the map to prevent overgrowth.
                 pid_map.remove(&pid);
+
+                // If we have no processes left in the pid map and that a shutdown has been requested,
+                // we can shutdown the reactor.
+                if shutdown_requested && pid_map.len() == 0 {
+                    break;
+                }
             }
-            Event::Signaled(pid, signal) => {}
+            Event::Signaled(pid, signal) => {
+                if let Some(app) = pid_map.get(&pid) {
+                    if app.restart && !shutdown_requested {
+                        logger.log_msg(format!("restarting app {} in {} sec(s)", app.name, app.restart_delay));
+                        spawn(
+                            app.clone(),
+                            sender.clone(),
+                            Duration::from_secs(app.restart_delay as u64),
+                        );
+                    }
+                }
+
+                match signal {
+                    Signal::SIGINT | Signal::SIGTERM | Signal::SIGQUIT | Signal::SIGABRT | Signal::SIGKILL => {
+                        pid_map.remove(&pid);
+                    }
+                    _ => {}
+                }
+
+                // If we have no processes left in the pid map and that a shutdown has been requested,
+                // we can shutdown the reactor.
+                if shutdown_requested && pid_map.len() == 0 {
+                    break;
+                }
+            }
         }
     }
 }

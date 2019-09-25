@@ -12,6 +12,7 @@ crossbeam-utils = "0.6"
 nix = "0.15"
 serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.8"
+signal-hook = "0.1"
 
 [profile.release]
 lto = true

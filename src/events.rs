@@ -1,31 +1,12 @@
 use std::io;
 use std::sync::Arc;
-use std::fmt;
 
 use crossbeam_channel::{Receiver, Sender};
 use nix::sys::signal::Signal;
-use nix::unistd::{self};
 
 use crate::spec::AppInfo;
+use crate::utils::Pid;
 
-#[derive(Debug, Copy, Clone, PartialEq, PartialOrd, Eq, Ord, Hash)]
-pub struct Pid(pub u32);
-
-impl From<unistd::Pid> for Pid {
-    fn from(pid: unistd::Pid) -> Pid {
-        let raw = pid.as_raw();
-        if raw < 0 {
-            panic!("events: negative PID");
-        }
-        Pid(raw as u32)
-    }
-}
-
-impl fmt::Display for Pid {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        self.0.fmt(f)
-    }
-}
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum StreamKind {
@@ -45,6 +26,7 @@ pub enum EventKind {
 #[derive(Debug)]
 pub enum Event {
     App { app: Arc<AppInfo>, kind: EventKind },
+    Signal(Signal),
     Exited(Pid, i32),
     Signaled(Pid, Signal),
 }
