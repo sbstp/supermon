@@ -1,12 +1,21 @@
 mod events;
 mod reactor;
+mod reaper;
 mod spec;
+mod signals;
+mod utils;
 
-use serde_yaml;
 use std::fs::File;
 use std::io::BufReader;
+use std::thread;
+
+use serde_yaml;
+use crossbeam_channel::bounded;
+use signal_hook::iterator::Signals;
 
 use crate::spec::Spec;
+use crate::events::{EventSender, EventReceiver};
+use crate::reactor::Reactor;
 
 fn main() {
     let spec_path = std::env::args_os().nth(1).expect("first argument must be spec path");
@@ -14,5 +23,24 @@ fn main() {
     let reader = BufReader::new(file);
     let spec: Spec = serde_yaml::from_reader(reader).expect("invalid spec");
 
-    reactor::run(spec);
+    let signals = Signals::new(&[
+        signal_hook::SIGTERM,
+        signal_hook::SIGINT,
+    ]).expect("unable to register signal handlers");
+
+    let (sender, receiver): (EventSender, EventReceiver) = bounded(128);
+
+    let signal_sender = sender.clone();
+    let reaper_sender = sender.clone();
+
+    thread::spawn(move || {
+        signals::start(signals, signal_sender);
+    });
+
+    thread::spawn(move || {
+        reaper::start(reaper_sender);
+    });
+
+    let reactor = Reactor::new(sender, receiver);
+    reactor.run(spec);
 }

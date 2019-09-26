@@ -1,0 +1,8 @@
+apps:
+  zombie-maker:
+    exec: python
+    workdir: /etc/supermon
+    args:
+      - -u
+      - zombie-maker.py
+    restart: false
