@@ -6,7 +6,6 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
-use crossbeam_utils::thread::scope;
 use nix::sys::signal::{kill, Signal};
 use nix::unistd::setpgid;
 
@@ -89,19 +88,22 @@ fn spawn_thread(app: Arc<AppInfo>, sender: EventSender, delay: Duration) {
         }
     };
 
-    let _ = scope(|s| {
-        if let Some(stdout) = proc.stdout.take() {
-            s.spawn(|_| {
-                stream_handler(app.clone(), sender.clone(), stdout, StreamKind::Stdout);
-            });
-        }
+    let app_out = app.clone();
+    let app_err = app.clone();
+    let sender_out = sender.clone();
+    let sender_err = sender.clone();
 
-        if let Some(stderr) = proc.stderr.take() {
-            s.spawn(|_| {
-                stream_handler(app.clone(), sender.clone(), stderr, StreamKind::Stderr);
-            });
-        }
-    });
+    if let Some(stdout) = proc.stdout.take() {
+        thread::spawn(move || {
+            stream_handler(app_out, sender_out, stdout, StreamKind::Stdout);
+        });
+    }
+
+    if let Some(stderr) = proc.stderr.take() {
+        thread::spawn(move || {
+            stream_handler(app_err, sender_err, stderr, StreamKind::Stderr);
+        });
+    }
 }
 
 fn spawn(app: Arc<AppInfo>, sender: EventSender, delay: Duration) {
