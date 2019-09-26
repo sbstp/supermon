@@ -72,7 +72,9 @@ fn spawn_thread(app: Arc<AppInfo>, sender: EventSender, delay: Duration) {
             .stderr(stderr)
             .current_dir(&app.workdir)
             .pre_exec(|| {
-                setpgid(Pid(0).to_nix(), Pid(0).to_nix()); // TODO handle error
+                if setpgid(Pid(0).to_nix(), Pid(0).to_nix()).is_err() {
+                    return Err(io::Error::new(io::ErrorKind::Other, "could not setpgrp"));
+                }
                 Ok(())
             })
             .spawn()
@@ -189,7 +191,7 @@ impl Reactor {
         self.shutdown_requested = true;
 
         for pid in self.processes.keys() {
-            kill(pid.to_nix(), signal);
+            let _ = kill(pid.to_nix(), signal);
         }
     }
 
