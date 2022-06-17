@@ -8,7 +8,7 @@ edition = "2018"
 
 [dependencies]
 crossbeam-channel = "0.4"
-nix = "0.15"
+nix = "0.20"
 serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.8"
 signal-hook = "0.1"
